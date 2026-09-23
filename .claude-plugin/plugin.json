@@ -1,7 +1,7 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.3.0",
-  "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
+  "version": "0.4.0",
+  "description": "Verbatim Jev-guided compaction for Claude Code sessions, with rule-based pruning, prompt pinning, a summary tier for long text and a decision log.",
   "license": "MIT",
   "userConfig": {
     "apiKey": {
@@ -16,23 +16,59 @@
       "description": "Minimum Jev probability that a tool call or tool result is still needed; below it the item is removed.",
       "default": 0.5
     },
+    "toolThresholds": {
+      "type": "string",
+      "title": "Per-tool keep thresholds",
+      "description": "Comma-separated Tool=threshold pairs overriding the keep threshold, e.g. Read=0.6, Grep=0.6.",
+      "default": ""
+    },
     "preserveRecentMessages": {
       "type": "number",
       "title": "Recent messages to preserve",
       "description": "Number of newest messages pinned from compaction.",
       "default": 6
     },
+    "preserveRecentPrompts": {
+      "type": "number",
+      "title": "Recent prompts to preserve",
+      "description": "Everything from the Nth-newest user prompt on is pinned from pruning, and kept verbatim by the summary tier.",
+      "default": 3
+    },
+    "maxPinnedMessages": {
+      "type": "number",
+      "title": "Maximum pinned messages",
+      "description": "Caps what the recent-prompt pin covers, for long autonomous turns.",
+      "default": 40
+    },
     "compactAtPercent": {
       "type": "number",
       "title": "Compaction percentage",
-      "description": "Context percentage at which turn.complete requests compaction.",
+      "description": "Context percentage at which turn.complete requests compaction (either this or the token threshold triggers it).",
       "default": 60
+    },
+    "compactAtTokens": {
+      "type": "number",
+      "title": "Compaction token threshold",
+      "description": "Context tokens at which turn.complete requests compaction; 0 leaves it to the percentage.",
+      "default": 250000
+    },
+    "summaryAboveTokens": {
+      "type": "number",
+      "title": "Summary tier threshold",
+      "description": "When the pruned conversation is still above this many tokens, everything before the newest prompts is summarised by a fork of the session model; 0 turns the tier off.",
+      "default": 40000
     },
     "minReductionRatio": {
       "type": "number",
       "title": "Minimum reduction ratio",
       "description": "Minimum estimated character reduction required to replace history.",
       "default": 0.25
+    },
+    "resultPreviewChars": {
+      "type": "number",
+      "title": "Output preview for Jev",
+      "description": "Characters of each tool output (head and tail) shown to Jev when judging it; 0 hides outputs.",
+      "default": 300
     },
     "maxStateTokens": {
       "type": "number",
@@ -51,6 +87,18 @@
       "title": "Truncated tool result head",
       "description": "Characters of a tool result kept when Jev decides its full output is no longer needed; 0 keeps only the note.",
       "default": 300
+    },
+    "retries": {
+      "type": "number",
+      "title": "Jev retries",
+      "description": "Extra attempts for a failed Jev request before falling back.",
+      "default": 2
+    },
+    "logDir": {
+      "type": "string",
+      "title": "Decision log folder",
+      "description": "Where one JSON record per compaction is written; empty for ~/.local/state/fast-jev-compaction.",
+      "default": ""
     },
     "model": {
       "type": "string",

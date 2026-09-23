@@ -2,14 +2,18 @@ import type {
   On,
   PluginOptions,
   Register,
+  SessionCompactInput,
+  SessionCompactResult,
   SessionMessage,
   ToolResultSummary,
   ToolUseSummary,
   TurnCompleteInput,
 } from 'claude-code';
 
-import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
+import { compact, messageChars, reductionRatio, resolveOptions } from '../src/compact.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import { parseToolThresholds } from '../src/rules.js';
+import { estimateTokens, isPrompt, truncate } from '../src/state.js';
 import type {
   CompactOptions,
   CompactResult,
@@ -21,6 +25,8 @@ import type {
 
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
+  compactAtTokens: 250_000,
+  summaryAboveTokens: 40_000,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
 };
@@ -43,8 +49,14 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 export type HookConfig = CompactOptions & {
   apiKey?: string;
   compactAtPercent: number;
+  /** Context tokens at which turn.complete requests compaction; 0 leaves it to the percentage. */
+  compactAtTokens: number;
+  /** Above this many tokens after pruning, older text is summarised too; 0 turns that off. */
+  summaryAboveTokens: number;
   minReductionRatio: number;
   model: string;
+  /** Where each compaction's decision record is written; '' for the default under $HOME. */
+  logDir?: string;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -63,6 +75,10 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   for (const key of [
     'keepThreshold',
     'preserveRecentMessages',
+    'preserveRecentPrompts',
+    'maxPinnedMessages',
+    'resultPreviewChars',
+    'retries',
     'maxStateTokens',
     'maxRequestTokens',
     'truncateHeadChars',
@@ -73,6 +89,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   const config: HookConfig = {
     ...numbers,
     compactAtPercent: optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent),
+    compactAtTokens: optionNumber(options, 'compactAtTokens', HOOK_DEFAULTS.compactAtTokens),
+    summaryAboveTokens: optionNumber(options, 'summaryAboveTokens', HOOK_DEFAULTS.summaryAboveTokens),
     minReductionRatio: optionNumber(
       options,
       'minReductionRatio',
@@ -84,6 +102,10 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   if (apiKey) config.apiKey = apiKey;
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
+  const thresholds = parseToolThresholds(optionString(options, 'toolThresholds'));
+  if (Object.keys(thresholds).length > 0) config.toolThresholds = thresholds;
+  const logDir = optionString(options, 'logDir');
+  if (logDir) config.logDir = logDir;
   return config;
 }
 
@@ -172,6 +194,122 @@ export async function compactSession(
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
+/** Estimated tokens of a transcript: text, tool inputs and tool outputs. */
+export function transcriptTokens(messages: readonly Message[]): number {
+  let tokens = 0;
+  for (const message of messages) {
+    tokens += estimateTokens(message.text);
+    for (const tool of message.toolUses) {
+      tokens += estimateTokens(JSON.stringify(tool.input) ?? '') + estimateTokens(tool.text ?? '');
+    }
+    for (const result of message.toolResults ?? []) tokens += estimateTokens(result.text);
+  }
+  return tokens;
+}
+
+/**
+ * Where the second tier cuts: the Nth-newest prompt of the pruned transcript
+ * (at least the newest one). Everything before it is summarised; it and what
+ * follows stay verbatim. -1 when there is nothing before it to summarise.
+ */
+export function summaryCut(messages: readonly Message[], recentPrompts: number): number {
+  const prompts: number[] = [];
+  messages.forEach((message, index) => {
+    if (isPrompt(message)) prompts.push(index);
+  });
+  const cut = prompts[Math.max(0, prompts.length - Math.max(1, recentPrompts))];
+  return cut === undefined || cut <= 0 ? -1 : cut;
+}
+
+export const SUMMARY_HEADER =
+  '[fast-jev-compaction: the earlier part of this conversation was summarised; what follows the summary is verbatim]';
+
+/** The question the fork answers: a summary of everything before the cut. */
+export function summaryPrompt(cutText: string): string {
+  return [
+    'This conversation is being compacted. Summarise ONLY the part that comes BEFORE the user message that begins:',
+    '',
+    `> ${truncate(cutText.replace(/\s+/g, ' '), 300)}`,
+    '',
+    'That message and everything after it stay verbatim, so do not summarise them. Your summary replaces the earlier part entirely, so keep what the work still depends on:',
+    "- the user's goals, requests, preferences and constraints, quoting short ones exactly",
+    '- decisions made and why, including approaches that were tried and rejected',
+    '- files created, modified or deleted, and their current state',
+    '- results of commands or tests that still matter, and errors still unresolved',
+    "- corrections the user made to the assistant's work",
+    '- open tasks and agreed next steps',
+    'Write dense, factual notes under short headings. No preamble. Output only the summary.',
+  ].join('\n');
+}
+
+export function summaryMessage(text: string): SessionMessage {
+  return { role: 'user', text: `${SUMMARY_HEADER}\n\n${text.trim()}`, toolUses: [] };
+}
+
+export type CompactionRecord = {
+  time: string;
+  trigger: string;
+  agentId?: string;
+  outcome: 'jev' | 'jev+summary' | 'fallback';
+  reason?: string;
+  messagesBefore: number;
+  /** One `role:textChars:toolUses:toolResults[:P]` per message (P marks a prompt), for diagnosing pinning. */
+  shape?: string[];
+  messagesAfter?: number;
+  tokensBefore: number;
+  tokensAfterPrune?: number;
+  tokensAfter?: number;
+  stats?: CompactResult['stats'];
+  summary?: { chars: number; usage?: unknown } | { skipped: string };
+  decisions?: Array<{
+    id: string;
+    tool: string;
+    action: string;
+    reason: string;
+    keepCall: number;
+    keepResult: number;
+    input: string;
+  }>;
+};
+
+/** The decisions as the record keeps them: each call's input, cut short, beside the verdict. */
+export function recordDecisions(
+  messages: readonly Message[],
+  result: CompactResult,
+): NonNullable<CompactionRecord['decisions']> {
+  const inputs = new Map<string, string>();
+  let n = 0;
+  const results = new Set<string>();
+  for (const message of messages) for (const r of message.toolResults ?? []) results.add(r.tool_use_id);
+  for (const message of messages) {
+    for (const tool of message.toolUses) {
+      if (!results.has(tool.tool_use_id)) continue;
+      n += 1;
+      inputs.set(`t${n}`, truncate(JSON.stringify(tool.input) ?? '', 200));
+    }
+  }
+  return result.decisions.map((d) => ({
+    id: d.id,
+    tool: d.tool,
+    action: d.action,
+    reason: d.reason,
+    keepCall: Math.round(d.keepCall * 1000) / 1000,
+    keepResult: Math.round(d.keepResult * 1000) / 1000,
+    input: inputs.get(d.id) ?? '',
+  }));
+}
+
+export function messageShape(messages: readonly Message[]): string[] {
+  return messages.map(
+    (m) =>
+      `${m.role[0]}:${m.text.length}:${m.toolUses.length}:${m.toolResults?.length ?? 0}${isPrompt(m) ? ':P' : ''}`,
+  );
+}
+
+export function recordPath(dir: string, time: string, trigger: string): string {
+  return `${dir.replace(/\/+$/, '')}/${time.replace(/[:.]/g, '-')}-${trigger}.json`;
+}
+
 function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
@@ -256,44 +394,114 @@ function notify(
   $.ui.toast(text, { timeoutMs: 15_000 });
 }
 
+type Engine = Parameters<Parameters<On>[2]>[0];
+
+async function writeRecord($: Engine, config: HookConfig, record: CompactionRecord): Promise<void> {
+  try {
+    const home = await $.env.get('HOME');
+    const dir = config.logDir || (home ? `${home}/.local/state/fast-jev-compaction` : '');
+    if (!dir) return;
+    await $.fs.write(recordPath(dir, record.time, record.trigger), JSON.stringify(record, null, 1));
+  } catch (error) {
+    $.ui.log(`could not write the compaction record (${error instanceof Error ? error.message : String(error)})`);
+  }
+}
+
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
 
-  on('session.compact', async ($, event, next) => {
+  on('session.compact', async ($, event: SessionCompactInput, next) => {
+    const record: CompactionRecord = {
+      time: new Date().toISOString(),
+      trigger: event.trigger,
+      outcome: 'fallback',
+      messagesBefore: event.messages.length,
+      shape: messageShape(event.messages),
+      tokensBefore: transcriptTokens(event.messages),
+    };
+    if (event.agentId) record.agentId = event.agentId;
+    const fallback = async (reason: string) => {
+      notify($, `fallback to built-in summary (${reason})`);
+      record.reason = reason;
+      await writeRecord($, configured, record);
+      return next(event);
+    };
+    let pruned: SessionCompaction;
+    const config = { ...configured, apiKey: await getApiKey($, configured).catch(() => undefined) };
     try {
-      const config = { ...configured, apiKey: await getApiKey($, configured) };
-      const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
+      pruned = await compactSession(event.messages, config, async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
       });
-      for (const line of decisionLogLines(result)) $.ui.log(line);
-      if (reductionRatio(result) < config.minReductionRatio) {
-        notify(
-          $,
-          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
-        );
-        return next(event);
-      }
-      notify(
-        $,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
-      );
-      return { messages };
     } catch (error) {
-      notify(
-        $,
-        `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
-      );
-      return next(event);
+      return fallback(error instanceof Error ? error.message : String(error));
     }
+    const { result } = pruned;
+    let messages = pruned.messages;
+    record.stats = result.stats;
+    record.decisions = recordDecisions(event.messages, result);
+    record.tokensAfterPrune = transcriptTokens(messages);
+    for (const line of decisionLogLines(result)) $.ui.log(line);
+
+    const summarising =
+      config.summaryAboveTokens > 0 &&
+      record.tokensAfterPrune > config.summaryAboveTokens &&
+      event.trigger !== 'precompute' &&
+      !event.agentId;
+    if (summarising) {
+      const cut = summaryCut(messages, config.preserveRecentPrompts ?? resolveOptions().preserveRecentPrompts);
+      if (cut < 0) {
+        record.summary = { skipped: 'no earlier prompt to cut at' };
+      } else {
+        const reply = await $.model.fork({ prompt: summaryPrompt(messages[cut]!.text) });
+        if (reply.isAnswered && reply.text.trim()) {
+          messages = [summaryMessage(reply.text), ...messages.slice(cut)];
+          record.summary = { chars: reply.text.length, usage: reply.usage };
+          record.outcome = 'jev+summary';
+        } else {
+          // No fork (a session resumed straight into /compact has no reply to
+          // fork from): the engine's own summarizer over the older part alone.
+          const forkReason = reply.isAnswered ? 'empty reply' : reply.reason;
+          const core: SessionCompactResult = await next({ ...event, messages: messages.slice(0, cut) }).catch(
+            (error: unknown) => ({ skip: error instanceof Error ? error.message : String(error) }),
+          );
+          if (core.messages && core.messages.length > 0) {
+            const summaryChars = core.messages.reduce((sum, m) => sum + messageChars(m), 0);
+            messages = [...core.messages, ...messages.slice(cut)];
+            record.summary = { chars: summaryChars, usage: `core summarizer (fork: ${forkReason})` };
+            record.outcome = 'jev+summary';
+          } else {
+            record.summary = { skipped: `fork: ${forkReason}; core: ${core.skip ?? 'no messages'}` };
+          }
+        }
+      }
+    }
+
+    record.messagesAfter = messages.length;
+    record.tokensAfter = transcriptTokens(messages);
+    const reduction = record.tokensBefore === 0 ? 0 : 1 - record.tokensAfter / record.tokensBefore;
+    if (record.outcome !== 'jev+summary' && reductionRatio(result) < config.minReductionRatio) {
+      return fallback(`below ${percent(config.minReductionRatio)} minimum: ${summarize(result)}`);
+    }
+    if (record.outcome === 'fallback') record.outcome = 'jev';
+    await writeRecord($, configured, record);
+    notify(
+      $,
+      `kept ${messages.length}/${event.messages.length} messages, ${
+        record.outcome === 'jev+summary' ? 'older text summarised' : 'no summary'
+      }, ~${percent(reduction)} smaller (${summarize(result)})`,
+    );
+    return { messages };
   });
 
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
     if (compacting) return next(event);
     try {
       const { context } = await $.session.usage();
-      if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
+      const byTokens = configured.compactAtTokens > 0 && (context.tokens ?? 0) >= configured.compactAtTokens;
+      const byPercent = (context.percent ?? 0) >= configured.compactAtPercent;
+      if (!byTokens && !byPercent) return next(event);
       compacting = true;
       await $.session.compact();
     } catch (error) {

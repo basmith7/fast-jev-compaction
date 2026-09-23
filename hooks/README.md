@@ -49,9 +49,17 @@ The plugin declares these `userConfig` values in
 | Option | Default |
 | --- | ---: |
 | `keepThreshold` | `0.5` |
+| `toolThresholds` | `''` (e.g. `Read=0.6, Grep=0.6`) |
 | `preserveRecentMessages` | `6` |
+| `preserveRecentPrompts` | `3` |
+| `maxPinnedMessages` | `40` |
 | `compactAtPercent` | `60` |
+| `compactAtTokens` | `250000` |
+| `summaryAboveTokens` | `40000` |
 | `minReductionRatio` | `0.25` |
+| `resultPreviewChars` | `300` |
+| `retries` | `2` |
+| `logDir` | `''` (`~/.local/state/fast-jev-compaction`) |
 | `maxStateTokens` | `25000` |
 | `maxRequestTokens` | `30000` |
 | `truncateHeadChars` | `300` |
@@ -61,23 +69,30 @@ The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
 through `TYPESAFE_API_KEY`. The environment variable is the recommended
 development setup.
 
-Every option except `apiKey`, `compactAtPercent`, `minReductionRatio` and
-`model` is passed straight to the library; see the root README for what they
+Every option except `apiKey`, `compactAtPercent`, `compactAtTokens`,
+`summaryAboveTokens`, `minReductionRatio`, `logDir` and `model` is passed
+straight to the library; see the root README for what they
 do. The `session.compact` hook runs the Jev requests concurrently. If Jev fails,
 the response is malformed, the key is unavailable, the history cannot be
 fitted into the state budget, or the estimated reduction is below
 `minReductionRatio`, the hook logs a fallback and delegates to Claude Code's
 built-in compaction. The outcome is shown as a toast and logged with the
 reduction, per-reason counts, state size and request count; a per-call
-`decisions:` line with both probabilities is logged for diagnosis. The
-`turn.complete` hook requests
-compaction when `context.percent` reaches `compactAtPercent`, with an
-in-flight guard.
+`decisions:` line with both probabilities is logged for diagnosis. After pruning, when
+the conversation is still above `summaryAboveTokens` (and this is neither a
+`precompute` nor a subagent's compaction), everything before the
+`preserveRecentPrompts`-th newest prompt is replaced by a summary from
+`$.model.fork`, or from the engine's summarizer run over that part alone when
+there is nothing to fork. Every outcome, fallbacks included, is written as a
+JSON record to `logDir`. The `turn.complete` hook requests compaction when
+`context.tokens` reaches `compactAtTokens` or `context.percent` reaches
+`compactAtPercent`, with an in-flight guard; headless and SDK sessions cannot
+compact from a hook, so there it logs `auto-compact skipped` and does nothing.
 
 ## Scope and caveat
 
 Function hooks are early access and may change between Claude Code releases.
-This mod uses the generated declarations from 2.1.274 in
+This mod uses the generated declarations from 2.1.280 in
 `types/claude-code.d.ts`; regenerate and review that file after a
 Claude Code upgrade.
 

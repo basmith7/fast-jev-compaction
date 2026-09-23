@@ -45,6 +45,8 @@ export interface ToolCall {
   isError: boolean;
   /** In the first or the newest preserved messages; never a candidate. */
   pinned: boolean;
+  /** Head and tail of the output for Jev; '' when previews are off. */
+  preview: string;
 }
 
 export interface CallAnswer {
@@ -60,7 +62,7 @@ export interface CallDecision extends CallAnswer {
   id: string;
   tool: string;
   action: CallAction;
-  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped';
+  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped' | 'superseded' | 'repeated';
 }
 
 export interface HistoryToolCall {
@@ -68,6 +70,8 @@ export interface HistoryToolCall {
   tool: string;
   input: string;
   result: string;
+  /** Head and tail of the output, so Jev can judge what it holds; dropped as the state shrinks. */
+  preview?: string;
 }
 
 export interface HistoryEntry {
@@ -99,6 +103,16 @@ export interface CompactOptions {
   keepThreshold?: number;
   /** Newest messages never touched (the first message is always kept). Default 6. */
   preserveRecentMessages?: number;
+  /** Everything from the Nth-newest user prompt on is never touched. Default 3. */
+  preserveRecentPrompts?: number;
+  /** Caps what `preserveRecentPrompts` pins, for long autonomous turns. Default 40. */
+  maxPinnedMessages?: number;
+  /** Per-tool keep thresholds overriding `keepThreshold`, e.g. `{ Read: 0.6 }`. */
+  toolThresholds?: Record<string, number>;
+  /** Characters of each tool output shown to Jev (two thirds head, one third tail). Default 300. */
+  resultPreviewChars?: number;
+  /** Extra attempts for a failed Jev request before giving up. Default 2. */
+  retries?: number;
   /** Estimated token ceiling for the state. Default 25000. */
   maxStateTokens?: number;
   /** Estimated token ceiling for state plus one batch of questions. Default 30000. */
@@ -111,6 +125,11 @@ export interface ResolvedCompactOptions {
   goal: string;
   keepThreshold: number;
   preserveRecentMessages: number;
+  preserveRecentPrompts: number;
+  maxPinnedMessages: number;
+  toolThresholds: Record<string, number>;
+  resultPreviewChars: number;
+  retries: number;
   maxStateTokens: number;
   maxRequestTokens: number;
   truncateHeadChars: number;
@@ -130,6 +149,8 @@ export interface CompactResult {
     resultsDropped: number;
     callsDropped: number;
     pinned: number;
+    /** Calls decided by the rule pre-pass (superseded or repeated) without asking Jev. */
+    ruleDecided: number;
     stateTokens: number;
     /** Which fitting stage the state needed, '' when no request was made. */
     stateStage: string;

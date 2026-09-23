@@ -155,7 +155,7 @@ describe('state fitting', () => {
       ...fit,
       maxStateTokens: 300,
     });
-    expect(stage).toBe('inputs<=200');
+    expect(stage).toMatch(/^inputs<=/);
     expect(tokens).toBeLessThanOrEqual(300);
     expect(state.history[0]?.text).toBe('start');
     expect((state.history[1]?.tool_calls?.[0] as HistoryToolCall).input.length).toBeLessThanOrEqual(200);
@@ -336,7 +336,7 @@ describe('compact', () => {
   it('resends the full state with every batch and merges the answers', async () => {
     const seen: Seen[] = [];
     const messages = transcript();
-    const stateTokens = fitState(messages, collectToolCalls(messages, 1), {
+    const stateTokens = fitState(messages, collectToolCalls(messages, { preserveRecentMessages: 1, resultPreviewChars: 300 }), {
       ...fit,
       goal: '',
       preserveRecentMessages: 1,
@@ -344,7 +344,7 @@ describe('compact', () => {
     const output = await compact(
       messages,
       fakeJev((name) => (name.startsWith('call_') ? 0.9 : 0.1), seen),
-      { preserveRecentMessages: 1, maxRequestTokens: stateTokens + 150 },
+      { preserveRecentMessages: 1, preserveRecentPrompts: 0, maxRequestTokens: stateTokens + 400 },
     );
 
     expect(output.stats.requests).toBe(seen.length);
@@ -374,7 +374,7 @@ describe('compact', () => {
   });
 
   it('reports a tiny reduction when Jev wants everything kept', async () => {
-    const output = await compact(transcript(), fakeJev(() => 0.95), { preserveRecentMessages: 1 });
+    const output = await compact(transcript(), fakeJev(() => 0.95), { preserveRecentMessages: 1, preserveRecentPrompts: 0 });
     expect(output.decisions.every((d) => d.action === 'keep')).toBe(true);
     expect(reductionRatio(output)).toBe(0);
   });
@@ -383,7 +383,7 @@ describe('compact', () => {
     const broken: JevAsker = {
       ask: async () => ({ answers: { call_t1: { noul: 0.5 } } }),
     };
-    await expect(compact(transcript(), broken, { preserveRecentMessages: 1 })).rejects.toThrow(
+    await expect(compact(transcript(), broken, { preserveRecentMessages: 1, preserveRecentPrompts: 0 })).rejects.toThrow(
       /Invalid Jev answer/,
     );
   });
@@ -427,7 +427,7 @@ describe('HTTP client', () => {
     const keyless = new JevClient({ apiKey: '' });
     await expect(keyless.ask('s', {})).rejects.toThrow(/TYPESAFE_API_KEY/);
     await expect(
-      compactMessages(transcript(), { apiKey: '', preserveRecentMessages: 1 }),
+      compactMessages(transcript(), { apiKey: '', preserveRecentMessages: 1, preserveRecentPrompts: 0 }),
     ).rejects.toThrow(/TYPESAFE_API_KEY/);
   });
 });

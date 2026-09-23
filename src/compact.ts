@@ -1,4 +1,5 @@
 import { noulAnswer } from './request.js';
+import { isMutatingTool, ruleDecisions } from './rules.js';
 import { collectToolCalls, estimateTokens, fitState } from './state.js';
 import type {
   CallAnswer,
@@ -18,10 +19,19 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   goal: '',
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
+  preserveRecentPrompts: 3,
+  maxPinnedMessages: 40,
+  toolThresholds: {},
+  resultPreviewChars: 300,
+  retries: 2,
   maxStateTokens: 25_000,
   maxRequestTokens: 30_000,
   truncateHeadChars: 300,
 };
+
+function count0(value: number | undefined, fallback: number): number {
+  return Math.max(0, Math.floor(finite(value, fallback)));
+}
 
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
 const REQUEST_OVERHEAD_TOKENS = 20;
@@ -40,6 +50,13 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
         finite(options.preserveRecentMessages, DEFAULT_OPTIONS.preserveRecentMessages),
       ),
     ),
+    preserveRecentPrompts: count0(options.preserveRecentPrompts, DEFAULT_OPTIONS.preserveRecentPrompts),
+    maxPinnedMessages: count0(options.maxPinnedMessages, DEFAULT_OPTIONS.maxPinnedMessages),
+    toolThresholds: Object.fromEntries(
+      Object.entries(options.toolThresholds ?? {}).filter(([, value]) => Number.isFinite(value)),
+    ),
+    resultPreviewChars: count0(options.resultPreviewChars, DEFAULT_OPTIONS.resultPreviewChars),
+    retries: count0(options.retries, DEFAULT_OPTIONS.retries),
     maxStateTokens: Math.max(1, finite(options.maxStateTokens, DEFAULT_OPTIONS.maxStateTokens)),
     maxRequestTokens: Math.max(
       1,
@@ -58,10 +75,18 @@ export function questionsFor(call: ToolCall): JevQuestions {
     [`call_${call.id}`]: {
       type: 'noul',
       instructions: `Tool call ${call.id} (${call.tool}) should stay in the history: knowing this call was made, with its input, still matters for what the assistant does next`,
+      criteria: {
+        true: 'The call records something the rest of the conversation relies on: a change that was made, a check that was run, or where a fact came from',
+        false: 'The call was a dead end, a routine lookup, or is fully accounted for by later messages; forgetting it was made loses nothing',
+      },
     },
     [`result_${call.id}`]: {
       type: 'noul',
       instructions: `The full output of tool call ${call.id} (${call.tool}, ${call.resultChars} chars) should stay in the history verbatim: the assistant still needs its contents and re-running the tool would not do`,
+      criteria: {
+        true: 'The output holds details the ongoing work still depends on and that cannot simply be read again: a one-off result, an error being debugged, or content that has since changed',
+        false: 'The output is stale, superseded, already summarised in later messages, or cheap to reproduce by re-running the same tool',
+      },
     },
   };
 }
@@ -98,17 +123,24 @@ export function batchCalls(
   return batches;
 }
 
+/**
+ * Turns Jev's two probabilities into an action. A tool's own threshold, when
+ * set, overrides `keepThreshold`; a call that changed files is never dropped
+ * whole, only its output.
+ */
 export function decideCall(
   call: Pick<ToolCall, 'id' | 'tool' | 'pinned'>,
   answer: CallAnswer,
-  options: Pick<ResolvedCompactOptions, 'keepThreshold'>,
+  options: Pick<ResolvedCompactOptions, 'keepThreshold'> &
+    Partial<Pick<ResolvedCompactOptions, 'toolThresholds'>>,
 ): CallDecision {
   const base = { id: call.id, tool: call.tool, ...answer };
   if (call.pinned) return { ...base, action: 'keep', reason: 'pinned' };
-  if (answer.keepResult >= options.keepThreshold) {
+  const threshold = options.toolThresholds?.[call.tool] ?? options.keepThreshold;
+  if (answer.keepResult >= threshold) {
     return { ...base, action: 'keep', reason: 'kept' };
   }
-  if (answer.keepCall >= options.keepThreshold) {
+  if (answer.keepCall >= threshold || isMutatingTool(call.tool)) {
     return { ...base, action: 'drop_result', reason: 'result_dropped' };
   }
   return { ...base, action: 'drop_call', reason: 'call_dropped' };
@@ -118,9 +150,17 @@ async function askBatch(
   asker: JevAsker,
   state: CompactionState,
   batch: readonly ToolCall[],
+  retries: number,
 ): Promise<Map<string, CallAnswer>> {
   const questions: JevQuestions = Object.assign({}, ...batch.map(questionsFor));
-  const { answers } = await asker.ask(state, questions);
+  let answers: Awaited<ReturnType<JevAsker['ask']>>['answers'] | undefined;
+  for (let attempt = 0; answers === undefined; attempt += 1) {
+    try {
+      ({ answers } = await asker.ask(state, questions));
+    } catch (error) {
+      if (attempt >= retries) throw error;
+    }
+  }
   return new Map(
     batch.map((call) => [
       call.id,
@@ -261,8 +301,9 @@ export async function compact(
 ): Promise<CompactResult> {
   const started = Date.now();
   const resolved = resolveOptions(options);
-  const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
-  const candidates = calls.filter((call) => !call.pinned);
+  const calls = collectToolCalls(messages, resolved);
+  const rules = ruleDecisions(calls);
+  const candidates = calls.filter((call) => !call.pinned && !rules.has(call.id));
   const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
@@ -273,14 +314,18 @@ export async function compact(
     fitted = state;
     batches = batchCalls(candidates, state.tokens, resolved);
     const answered = await Promise.all(
-      batches.map((batch) => askBatch(asker, state.state, batch)),
+      batches.map((batch) => askBatch(asker, state.state, batch, resolved.retries)),
     );
     for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
   }
 
-  const decisions = calls.map((call) =>
-    decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
-  );
+  const decisions = calls.map((call): CallDecision => {
+    const rule = rules.get(call.id);
+    if (rule) {
+      return { id: call.id, tool: call.tool, keepCall: 1, keepResult: 0, action: 'drop_result', reason: rule };
+    }
+    return decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved);
+  });
   const kept = applyDecisions(
     messages,
     decisions,
@@ -300,6 +345,7 @@ export async function compact(
       resultsDropped: count(decisions, 'result_dropped'),
       callsDropped: count(decisions, 'call_dropped'),
       pinned: count(decisions, 'pinned'),
+      ruleDecided: rules.size,
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length,

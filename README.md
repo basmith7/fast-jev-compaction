@@ -5,6 +5,39 @@ every tool call and result is scored in one fast request, stale ones are
 dropped or truncated, everything kept stays verbatim. Also usable as an npm
 library.
 
+## This fork (0.4.0)
+
+Changes on top of upstream `tamaratran/fast-jev-compaction` 0.3.0:
+
+- **Rule pre-pass.** Stale outputs are handled in code, without asking Jev: a
+  `Read` of a file that a later call edits or writes (`superseded`), and any
+  call a later call repeats with identical input (`repeated`), keep the call
+  and lose the output.
+- **Changes are never dropped whole.** `Edit`, `Write`, `MultiEdit` and
+  `NotebookEdit` keep at least a stub, so the history still shows a file was
+  changed.
+- **Jev sees the outputs it judges.** Each call carries a head-and-tail
+  `preview` of its output (`resultPreviewChars`), dropped only when the state
+  has to shrink; both questions carry `criteria` for yes and no; per-tool
+  thresholds (`toolThresholds`) override `keepThreshold`.
+- **Pinning by prompts.** Everything from the third-newest prompt the person
+  typed is pinned (`preserveRecentPrompts`, capped by `maxPinnedMessages`),
+  not just the newest six messages. Engine-written user text (slash-command
+  echoes, reminders, task notices, summaries) does not count as a prompt.
+- **Summary tier.** When the pruned conversation is still above
+  `summaryAboveTokens`, everything before the newest prompts is summarised by
+  a fork of the session model (`$.model.fork`, served from the prompt cache)
+  and the rest stays verbatim; without a fork (a session resumed straight into
+  `/compact`) the engine's own summarizer runs over the older part alone.
+- **Decision records.** Every compaction writes one JSON record (outcome,
+  token counts, per-call verdicts with inputs, message shapes) to `logDir`,
+  default `~/.local/state/fast-jev-compaction/`.
+- **Earlier trigger and retries.** `turn.complete` also compacts at
+  `compactAtTokens` (default 250k); a failed Jev request is retried
+  (`retries`) before falling back. `$.session.compact` is unavailable in
+  headless and SDK sessions, so there only `/compact` and the engine's own
+  auto-compaction reach the hook.
+
 ## What and why
 
 Most context compaction asks an LLM to summarize old turns. A summary is
@@ -107,6 +140,11 @@ put it in a source file.
 | `goal` | last 3 user prompts | Ongoing task description included in the state |
 | `keepThreshold` | `0.5` | Minimum keep probability for a call or result to stay |
 | `preserveRecentMessages` | `6` | Newest messages never touched (the first is always kept) |
+| `preserveRecentPrompts` | `3` | Everything from the Nth-newest typed prompt on is never touched |
+| `maxPinnedMessages` | `40` | Cap on what `preserveRecentPrompts` pins |
+| `toolThresholds` | `{}` | Per-tool keep thresholds overriding `keepThreshold` |
+| `resultPreviewChars` | `300` | Characters of each output (head and tail) shown to Jev |
+| `retries` | `2` | Extra attempts for a failed Jev request |
 | `maxStateTokens` | `25000` | Estimated token ceiling for the state |
 | `maxRequestTokens` | `30000` | Estimated ceiling for state plus one batch of questions |
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
@@ -117,8 +155,10 @@ stage was needed, and the number of requests.
 
 ## Limitations
 
-- Only tool calls and results are candidates; text messages are never removed
-  or shortened in the output (they are only abridged in the state Jev sees).
+- Only tool calls and results are Jev candidates; text is shortened only by the
+  plugin's summary tier, never by the library.
+- The rule pre-pass only recognises dedicated file tools; reads done through
+  `Bash` (`cat`, `sed -n`) are left to Jev.
 - Token sizes are estimates from character counts, not a tokenizer.
 - Calibration is at the request level; a probability is not a proof that a
   result is safe to delete. The assistant can always re-run the tool.

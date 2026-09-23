@@ -3,9 +3,16 @@ import {
   compactSession,
   decisionLog,
   decisionLogLines,
+  recordDecisions,
+  recordPath,
   resolveHookConfig,
   summarize,
+  summaryCut,
+  summaryMessage,
+  summaryPrompt,
+  SUMMARY_HEADER,
   toSessionMessages,
+  transcriptTokens,
 } from '../hooks/fast-jev.ts';
 import { applyDecisions, collectToolCalls, decideCall, type Message } from '../src/index.js';
 
@@ -53,7 +60,13 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'jev-latest' });
+    expect(resolveHookConfig({})).toEqual({
+      compactAtPercent: 60,
+      compactAtTokens: 250_000,
+      summaryAboveTokens: 40_000,
+      minReductionRatio: 0.25,
+      model: 'jev-latest',
+    });
     expect(
       resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
     ).toEqual({
@@ -63,6 +76,8 @@ describe('hook config', () => {
       model: 'jev-x',
       goal: 'g',
       compactAtPercent: 60,
+      compactAtTokens: 250_000,
+      summaryAboveTokens: 40_000,
       minReductionRatio: 0.25,
     });
   });
@@ -112,7 +127,7 @@ describe('session message mapping', () => {
 describe('compactSession', () => {
   it('runs the library over the engine fetch and reports the outcome', async () => {
     const bodies: string[] = [];
-    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k', model: 'jev-x' };
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1, preserveRecentPrompts: 0 }), apiKey: 'k', model: 'jev-x' };
     const { result: output, messages } = await compactSession(
       transcript(),
       config,
@@ -128,7 +143,7 @@ describe('compactSession', () => {
   });
 
   it('splits a long decision log into ui.log lines under the host limit', async () => {
-    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1, preserveRecentPrompts: 0 }), apiKey: 'k' };
     const { result: output } = await compactSession(transcript(), config, jevFetch(() => 0.1));
     const lines = decisionLogLines(output, 60);
     expect(lines).toEqual([
@@ -140,10 +155,72 @@ describe('compactSession', () => {
   });
 
   it('throws on a missing key and on failed requests so the hook falls back', async () => {
-    const config = resolveHookConfig({ preserveRecentMessages: 1 });
+    const config = resolveHookConfig({ preserveRecentMessages: 1, preserveRecentPrompts: 0 });
     await expect(compactSession(transcript(), config, jevFetch(() => 0))).rejects.toThrow(/TYPESAFE_API_KEY/);
     await expect(
       compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);
+  });
+});
+
+describe('second tier', () => {
+  const convo = (): SessionMessage[] => [
+    message('user', 'first ask', { handle: 'p0' }),
+    message('assistant', 'long answer '.repeat(50), { handle: 'a0' }),
+    message('user', 'second ask', { handle: 'p1' }),
+    message('assistant', 'ok', { handle: 'a1' }),
+    message('user', 'third ask', { handle: 'p2' }),
+  ];
+
+  it('cuts at the Nth-newest prompt and never at the first message', () => {
+    expect(summaryCut(convo(), 2)).toBe(2);
+    expect(summaryCut(convo(), 1)).toBe(4);
+    expect(summaryCut(convo(), 0)).toBe(4);
+    expect(summaryCut(convo(), 3)).toBe(-1);
+    expect(summaryCut([message('assistant', 'x')], 1)).toBe(-1);
+  });
+
+  it('asks for a summary of only what precedes the cut', () => {
+    const prompt = summaryPrompt('second   ask\nwith detail');
+    expect(prompt).toContain('> second ask with detail');
+    expect(prompt).toMatch(/BEFORE/);
+    expect(summaryMessage('  notes ').text).toBe(`${SUMMARY_HEADER}\n\nnotes`);
+    expect(summaryMessage('x').handle).toBeUndefined();
+  });
+
+  it('estimates transcript tokens across text, inputs and outputs', () => {
+    const base = transcriptTokens([message('user', 'hello world')]);
+    expect(base).toBeGreaterThan(0);
+    expect(transcriptTokens(transcript())).toBeGreaterThan(base);
+  });
+});
+
+describe('decision record', () => {
+  it('pairs each decision with its call input and writes under a safe file name', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1, preserveRecentPrompts: 0 }), apiKey: 'k' };
+    const { result: output } = await compactSession(transcript(), config, jevFetch(() => 0.1));
+    const decisions = recordDecisions(transcript(), output);
+    expect(decisions.map((d) => [d.id, d.tool, d.input])).toEqual([
+      ['t1', 'Read', '{"file_path":"src/a.ts"}'],
+      ['t2', 'Bash', '{"command":"npm test"}'],
+    ]);
+    expect(recordPath('/x/logs/', '2026-09-22T10:00:00.000Z', 'auto')).toBe('/x/logs/2026-09-22T10-00-00-000Z-auto.json');
+  });
+
+  it('reads the new options', () => {
+    const config = resolveHookConfig({
+      toolThresholds: 'Read=0.7',
+      compactAtTokens: 100_000,
+      summaryAboveTokens: 0,
+      preserveRecentPrompts: 2,
+      logDir: '/tmp/x',
+    });
+    expect(config).toMatchObject({
+      toolThresholds: { Read: 0.7 },
+      compactAtTokens: 100_000,
+      summaryAboveTokens: 0,
+      preserveRecentPrompts: 2,
+      logDir: '/tmp/x',
+    });
   });
 });

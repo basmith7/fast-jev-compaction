@@ -2,6 +2,7 @@ import type {
   CompactionState,
   FittedState,
   HistoryEntry,
+  HistoryToolCall,
   Message,
   ResolvedCompactOptions,
   ToolCall,
@@ -9,7 +10,7 @@ import type {
 } from './types.js';
 
 export const STATE_CONTEXT =
-  'A coding assistant conversation is being compacted to free context. `history` is the whole conversation so far, oldest first; tool outputs are replaced by a short `result` note and long texts may be abridged. Each question asks whether one tool call, or the full output of that call, still needs to stay in the history verbatim. Whatever is not kept is deleted permanently, but the assistant can always re-run a tool or re-read a file.';
+  'A coding assistant conversation is being compacted to free context. `history` is the whole conversation so far, oldest first; tool outputs are replaced by a short `result` note, usually with a `preview` of the output\'s head and tail, and long texts may be abridged. Each question asks whether one tool call, or the full output of that call, still needs to stay in the history verbatim. Whatever is not kept is deleted permanently, but the assistant can always re-run a tool or re-read a file.';
 
 /** Successive caps on the serialised tool input included per call. */
 const INPUT_CHARS = [1000, 200, 60] as const;
@@ -47,22 +48,76 @@ function abridge(text: string, head: number, tail: number): string {
   return `${text.slice(0, head)}\n[… ${omitted} chars omitted …]\n${text.slice(-tail)}`;
 }
 
-export function isPinned(
-  index: number,
-  total: number,
-  preserveRecentMessages: number,
-): boolean {
-  return index === 0 || index >= total - preserveRecentMessages;
+export function isPinned(index: number, pinStart: number): boolean {
+  return index === 0 || index >= pinStart;
+}
+
+/**
+ * User-role text the engine writes, not the person: slash-command echoes and
+ * their output, reminders, background-task notices, and compaction summaries.
+ */
+const ENGINE_TEXT =
+  /^(<(command-name|command-message|command-args|local-command-stdout|local-command-stderr|local-command-caveat|system-reminder|task-notification|bash-input|bash-stdout|bash-stderr)>|\[fast-jev-compaction:|This session is being continued from a previous conversation)/;
+
+/** A prompt the person typed: a user message with text, no tool results, not engine-written. */
+export function isPrompt(message: Message): boolean {
+  const text = message.text.trim();
+  return (
+    message.role === 'user' &&
+    text.length > 0 &&
+    (message.toolResults ?? []).length === 0 &&
+    !ENGINE_TEXT.test(text)
+  );
+}
+
+export type PinOptions = Pick<
+  ResolvedCompactOptions,
+  'preserveRecentMessages' | 'preserveRecentPrompts' | 'maxPinnedMessages'
+>;
+
+/**
+ * The index from which messages are pinned: the Nth-newest prompt on (at most
+ * `maxPinnedMessages` messages), and never fewer than the newest
+ * `preserveRecentMessages`.
+ */
+export function pinStartIndex(messages: readonly Message[], options: Partial<PinOptions>): number {
+  const total = messages.length;
+  const recentMessages = options.preserveRecentMessages ?? 0;
+  const recentPrompts = options.preserveRecentPrompts ?? 0;
+  const maxPinned = options.maxPinnedMessages ?? total;
+  let promptStart = total;
+  if (recentPrompts > 0) {
+    const prompts: number[] = [];
+    messages.forEach((message, index) => {
+      if (isPrompt(message)) prompts.push(index);
+    });
+    promptStart = prompts[Math.max(0, prompts.length - recentPrompts)] ?? total;
+    promptStart = Math.max(promptStart, total - maxPinned);
+  }
+  return Math.max(0, Math.min(total - recentMessages, promptStart));
+}
+
+/** Head and tail of a tool output, `chars` in all; the whole text when short. */
+export function outputPreview(text: string, chars: number): string {
+  if (chars <= 0) return '';
+  if (text.length <= chars + 40) return text;
+  const head = Math.ceil((chars * 2) / 3);
+  const tail = chars - head;
+  return `${text.slice(0, head)}\n[… ${text.length - chars} chars …]\n${tail > 0 ? text.slice(-tail) : ''}`;
 }
 
 /**
  * Pairs every tool_use with its tool_result by `tool_use_id`. Calls without a
- * result are not candidates (there is nothing to drop yet).
+ * result are not candidates (there is nothing to drop yet). A bare number is
+ * `preserveRecentMessages`.
  */
 export function collectToolCalls(
   messages: readonly Message[],
-  preserveRecentMessages: number,
+  options: number | (Partial<PinOptions> & { resultPreviewChars?: number }),
 ): ToolCall[] {
+  const resolved = typeof options === 'number' ? { preserveRecentMessages: options } : options;
+  const pinStart = pinStartIndex(messages, resolved);
+  const previewChars = resolved.resultPreviewChars ?? 0;
   const results = new Map<string, { index: number; result: ToolResult }>();
   messages.forEach((message, index) => {
     for (const result of message.toolResults ?? []) {
@@ -83,9 +138,8 @@ export function collectToolCalls(
         resultIndex: found.index,
         resultChars: found.result.text.length,
         isError: found.result.isError ?? false,
-        pinned:
-          isPinned(callIndex, messages.length, preserveRecentMessages) ||
-          isPinned(found.index, messages.length, preserveRecentMessages),
+        pinned: isPinned(callIndex, pinStart) || isPinned(found.index, pinStart),
+        preview: outputPreview(found.result.text, previewChars),
       });
     }
   });
@@ -152,16 +206,21 @@ function historyEntries(
   messages: readonly Message[],
   calls: readonly ToolCall[],
   inputChars: number,
+  previews: boolean,
 ): HistoryEntry[] {
   const byMessage = callsByMessage(calls);
   const entries: HistoryEntry[] = [];
   messages.forEach((message, i) => {
-    const toolCalls = (byMessage.get(i) ?? []).map((call) => ({
-      id: call.id,
-      tool: call.tool,
-      input: inputText(call.input, inputChars),
-      result: resultNote(call),
-    }));
+    const toolCalls = (byMessage.get(i) ?? []).map((call) => {
+      const entry: HistoryToolCall = {
+        id: call.id,
+        tool: call.tool,
+        input: inputText(call.input, inputChars),
+        result: resultNote(call),
+      };
+      if (previews && call.preview) entry.preview = call.preview;
+      return entry;
+    });
     if (message.text.trim().length === 0 && toolCalls.length === 0) return;
     const entry: HistoryEntry = { i, role: message.role, text: message.text };
     if (toolCalls.length > 0) entry.tool_calls = toolCalls;
@@ -195,7 +254,7 @@ export function goalFromMessages(messages: readonly Message[]): string {
 export function fitState(
   messages: readonly Message[],
   calls: readonly ToolCall[],
-  options: Pick<ResolvedCompactOptions, 'maxStateTokens' | 'preserveRecentMessages' | 'goal'>,
+  options: Pick<ResolvedCompactOptions, 'maxStateTokens' | 'goal'> & Partial<PinOptions>,
 ): FittedState {
   const goal = options.goal || goalFromMessages(messages);
   const stateOf = (history: HistoryEntry[]): CompactionState => ({
@@ -214,8 +273,8 @@ export function fitState(
   let history: HistoryEntry[] = [];
   let perEntry: number[] = [];
   let tokens = 0;
-  const rebuild = (inputChars: number): void => {
-    history = historyEntries(messages, calls, inputChars);
+  const rebuild = (inputChars: number, previews: boolean): void => {
+    history = historyEntries(messages, calls, inputChars, previews);
     perEntry = history.map(entryTokens);
     tokens = baseTokens + perEntry.reduce((sum, n) => sum + n, 0);
   };
@@ -229,16 +288,19 @@ export function fitState(
     perEntry[index] = now;
   };
 
-  rebuild(INPUT_CHARS[0]);
+  rebuild(INPUT_CHARS[0], true);
   if (fits()) return fitted(history, tokens, 'full');
 
+  rebuild(INPUT_CHARS[1], true);
+  if (fits()) return fitted(history, tokens, `inputs<=${INPUT_CHARS[1]}`);
+
   for (const limit of INPUT_CHARS.slice(1)) {
-    rebuild(limit);
-    if (fits()) return fitted(history, tokens, `inputs<=${limit}`);
+    rebuild(limit, false);
+    if (fits()) return fitted(history, tokens, `inputs<=${limit}, no previews`);
   }
 
-  const pinned = (entry: HistoryEntry): boolean =>
-    isPinned(entry.i, messages.length, options.preserveRecentMessages);
+  const pinStart = pinStartIndex(messages, options);
+  const pinned = (entry: HistoryEntry): boolean => isPinned(entry.i, pinStart);
   const indices = history.map((_, index) => index);
   const order = [
     ...indices.filter((index) => !pinned(history[index]!)),
