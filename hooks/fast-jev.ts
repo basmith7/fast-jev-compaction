@@ -15,6 +15,7 @@ import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request
 import { parseToolThresholds } from '../src/rules.js';
 import { estimateTokens, isPrompt, truncate } from '../src/state.js';
 import type {
+  ArchiveResult,
   CompactOptions,
   CompactResult,
   JevAsker,
@@ -24,6 +25,7 @@ import type {
 } from '../src/types.js';
 
 const HOOK_DEFAULTS = {
+  archiveResults: true,
   compactAtPercent: 60,
   compactAtTokens: 250_000,
   summaryAboveTokens: 40_000,
@@ -57,6 +59,8 @@ export type HookConfig = CompactOptions & {
   model: string;
   /** Where each compaction's decision record is written; '' for the default under $HOME. */
   logDir?: string;
+  /** Save the output of dropped calls and truncated results under ARCHIVE_DIR. */
+  archiveResults: boolean;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -97,6 +101,10 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       HOOK_DEFAULTS.minReductionRatio,
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
+    archiveResults:
+      typeof options['archiveResults'] === 'boolean'
+        ? options['archiveResults']
+        : HOOK_DEFAULTS.archiveResults,
   };
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
@@ -183,15 +191,78 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
-/** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
+/**
+ * Runs the library over a session transcript; throws when the key is missing or
+ * Jev fails. With `archive`, the files it named are written before returning.
+ */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
+  archive?: ArchiveWriter,
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), {
+    ...config,
+    ...(archive ? { archive: archive.cite } : {}),
+  });
+  if (archive) await archive.flush();
   return { result, messages: toSessionMessages(messages, result.messages) };
+}
+
+/** Project-relative, so the agent can Read or grep a saved output without leaving the project. */
+export const ARCHIVE_DIR = '.claude/fast-jev-compaction';
+
+const SECRET_INPUT =
+  /(^|[|;&\s"'])(printenv|env)\b|\.env\b|\b(secret|secrets|credential|credentials|password|passwd|token|keychain|netrc|id_rsa|id_ed25519|private[_-]?key)\b|\.(pem|key|p12|pfx)\b/i;
+const SECRET_OUTPUT =
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(aws_secret_access_key|api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|password)\s*["']?\s*[=:]\s*\S|:\/\/[^\s:@/]+:[^\s:@/]+@/i;
+/** Well-known token formats (AWS, GitHub, OpenAI-style, Slack), matched case-sensitively. */
+const SECRET_TOKEN =
+  /\b(AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_\w{20,}|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,})/;
+
+/** True when a tool call's input or output looks like it carries credentials. */
+export function looksSecret(input: Record<string, unknown>, output: string): boolean {
+  let inputText = '';
+  try {
+    inputText = JSON.stringify(input) ?? '';
+  } catch {
+    inputText = '';
+  }
+  return SECRET_INPUT.test(inputText) || SECRET_OUTPUT.test(output) || SECRET_TOKEN.test(output);
+}
+
+export type ArchiveWriter = {
+  /** Names the file an output will be written to, for its marker; undefined skips it. */
+  cite: ArchiveResult;
+  /** Writes the files named so far. */
+  flush: () => Promise<void>;
+};
+
+/**
+ * Saves the output compaction removes, so a detail buried in it can be read
+ * back later instead of being lost. Nothing that looks like a credential is
+ * written; nothing at all is written when no output was cited.
+ */
+export function archiveWriter($: {
+  fs: { exists: (path: string) => Promise<boolean>; write: (path: string, text: string) => Promise<void> };
+}): ArchiveWriter {
+  const pending = new Map<string, string>();
+  return {
+    cite({ tool_use_id, input, text }) {
+      if (!text || looksSecret(input, text)) return undefined;
+      const path = `${ARCHIVE_DIR}/result-${tool_use_id.replace(/[^\w-]/g, '_')}.txt`;
+      pending.set(path, text);
+      return path;
+    },
+    async flush() {
+      if (pending.size === 0) return;
+      const ignorePath = `${ARCHIVE_DIR}/.gitignore`;
+      if (!(await $.fs.exists(ignorePath))) await $.fs.write(ignorePath, '*\n');
+      for (const [path, text] of pending) await $.fs.write(path, text);
+      pending.clear();
+    },
+  };
 }
 
 /** Estimated tokens of a transcript: text, tool inputs and tool outputs. */
@@ -430,10 +501,15 @@ export const register: Register = (on: On, options: PluginOptions) => {
     let pruned: SessionCompaction;
     const config = { ...configured, apiKey: await getApiKey($, configured).catch(() => undefined) };
     try {
-      pruned = await compactSession(event.messages, config, async (url, init) => {
-        const response = await $.http.fetch(url, init);
-        return { status: response.status, ok: response.ok, text: response.text };
-      });
+      pruned = await compactSession(
+        event.messages,
+        config,
+        async (url, init) => {
+          const response = await $.http.fetch(url, init);
+          return { status: response.status, ok: response.ok, text: response.text };
+        },
+        config.archiveResults ? archiveWriter($) : undefined,
+      );
     } catch (error) {
       return fallback(error instanceof Error ? error.message : String(error));
     }

@@ -88,6 +88,12 @@
       "description": "Characters of a tool result kept when Jev decides its full output is no longer needed; 0 keeps only the note.",
       "default": 300
     },
+    "archiveResults": {
+      "type": "boolean",
+      "title": "Save removed output",
+      "description": "Write the full output of each dropped call or truncated result to .claude/fast-jev-compaction/ in the project (git-ignored) and cite the file in its place, so it can be read back. Output that looks like credentials is never written.",
+      "default": true
+    },
     "retries": {
       "type": "number",
       "title": "Jev retries",

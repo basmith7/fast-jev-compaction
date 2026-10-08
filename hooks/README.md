@@ -12,7 +12,15 @@ every tool call outside the pinned first and newest messages, two questions:
 whether the call should stay and whether its full output should stay. An
 item is kept when Jev's probability reaches `keepThreshold`; a dropped result
 is truncated to its first `truncateHeadChars` characters plus a one-line note,
-and a dropped call disappears with its result.
+and a dropped call disappears with its result, leaving one line naming it.
+
+With `archiveResults` on (the default), the full output of every removed call
+and truncated result is written to `.claude/fast-jev-compaction/result-<id>.txt`
+in the project (the folder gets a `*` `.gitignore`), and the note cites that
+path so the assistant can Read or grep it. Output whose tool input or text
+looks like a credential (`.env`, `printenv`, private keys, `password=`, AWS,
+GitHub, OpenAI-style or Slack tokens, `user:pass@` URLs) is never written; its
+note says to re-run the tool instead.
 
 The state is fitted into `maxStateTokens` in stages: tool inputs are
 truncated, then long texts are abridged (oldest first, pinned messages last),
@@ -63,6 +71,7 @@ The plugin declares these `userConfig` values in
 | `maxStateTokens` | `25000` |
 | `maxRequestTokens` | `30000` |
 | `truncateHeadChars` | `300` |
+| `archiveResults` | `true` |
 | `model` | `jev-latest` |
 
 The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
@@ -70,7 +79,7 @@ through `TYPESAFE_API_KEY`. The environment variable is the recommended
 development setup.
 
 Every option except `apiKey`, `compactAtPercent`, `compactAtTokens`,
-`summaryAboveTokens`, `minReductionRatio`, `logDir` and `model` is passed
+`summaryAboveTokens`, `minReductionRatio`, `logDir`, `archiveResults` and `model` is passed
 straight to the library; see the root README for what they
 do. The `session.compact` hook runs the Jev requests concurrently. If Jev fails,
 the response is malformed, the key is unavailable, the history cannot be

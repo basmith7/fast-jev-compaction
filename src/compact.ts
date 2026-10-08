@@ -2,6 +2,7 @@ import { noulAnswer } from './request.js';
 import { isMutatingTool, ruleDecisions } from './rules.js';
 import { collectToolCalls, estimateTokens, fitState } from './state.js';
 import type {
+  ArchiveResult,
   CallAnswer,
   CallDecision,
   CompactOptions,
@@ -172,31 +173,79 @@ async function askBatch(
   );
 }
 
-function truncatedResultText(text: string, isError: boolean, headChars: number): string {
-  if (text.length <= headChars + 120) return text;
+function isTruncated(text: string, headChars: number): boolean {
+  return text.length > headChars + 120;
+}
+
+function recoverNote(archivedPath: string | undefined): string {
+  return archivedPath
+    ? `; full output: ${archivedPath} (Read or grep it if needed)`
+    : '; re-run the tool if needed';
+}
+
+function truncatedResultText(
+  text: string,
+  isError: boolean,
+  headChars: number,
+  archivedPath?: string,
+): string {
+  if (!isTruncated(text, headChars)) return text;
   const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : '';
   return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
     isError ? ' (error)' : ''
-  }; re-run the tool if needed]`;
+  }${recoverNote(archivedPath)}]`;
+}
+
+/** One line standing in for a dropped call, naming where its output went. */
+function droppedCallNote(tool: ToolUse, archivedPath: string | undefined): string {
+  let input = '';
+  try {
+    input = JSON.stringify(tool.input) ?? '{}';
+  } catch {
+    input = '{}';
+  }
+  if (input.length > 160) input = `${input.slice(0, 159)}…`;
+  return `[fast-jev-compaction removed the ${tool.tool} call ${input}${
+    archivedPath ? recoverNote(archivedPath) : ''
+  }]`;
 }
 
 /**
  * Rebuilds the conversation from the decisions. A dropped call disappears
- * together with its result; a dropped result keeps a bounded head and note.
- * Messages that lose all their content are removed; untouched messages are
- * returned as the same objects they came in as.
+ * together with its result, leaving one line in its message naming it; a
+ * dropped result keeps a bounded head and note. With `archive`, the output of
+ * each dropped call or truncated result is handed over first and the path it
+ * returns is cited, so a detail inside can be read back. Messages that lose
+ * all their content are removed; untouched messages are returned as the same
+ * objects they came in as.
  */
 export function applyDecisions(
   messages: readonly Message[],
   decisions: readonly CallDecision[],
   calls: readonly ToolCall[],
   headChars: number,
+  archive?: ArchiveResult,
 ): Message[] {
   const byId = new Map(calls.map((call) => [call.id, call]));
   const actions = new Map<string, CallDecision['action']>();
   for (const decision of decisions) {
     const call = byId.get(decision.id);
     if (call && decision.action !== 'keep') actions.set(call.tool_use_id, decision.action);
+  }
+  const archived = new Map<string, string>();
+  if (archive) {
+    const outputs = new Map<string, string>();
+    for (const message of messages) {
+      for (const result of message.toolResults ?? []) outputs.set(result.tool_use_id, result.text);
+    }
+    for (const call of calls) {
+      const action = actions.get(call.tool_use_id);
+      const text = outputs.get(call.tool_use_id) ?? '';
+      if (!action || !text) continue;
+      if (action === 'drop_result' && !isTruncated(text, headChars)) continue;
+      const path = archive({ tool_use_id: call.tool_use_id, tool: call.tool, input: call.input, text });
+      if (path) archived.set(call.tool_use_id, path);
+    }
   }
   const kept: Message[] = [];
   for (const message of messages) {
@@ -207,6 +256,9 @@ export function applyDecisions(
       kept.push(message);
       continue;
     }
+    const notes = message.toolUses
+      .filter((tool) => actions.get(tool.tool_use_id) === 'drop_call')
+      .map((tool) => droppedCallNote(tool, archived.get(tool.tool_use_id)));
     const toolUses = message.toolUses
       .filter((tool) => actions.get(tool.tool_use_id) !== 'drop_call')
       .map((tool) => {
@@ -215,6 +267,7 @@ export function applyDecisions(
           tool.text ?? '',
           tool.isError ?? false,
           headChars,
+          archived.get(tool.tool_use_id),
         );
         if ((tool.text ?? '') === text) return tool;
         const copy: ToolUse = {
@@ -230,7 +283,12 @@ export function applyDecisions(
       .filter((result) => actions.get(result.tool_use_id) !== 'drop_call')
       .map((result) => {
         if (actions.get(result.tool_use_id) !== 'drop_result') return result;
-        const text = truncatedResultText(result.text, result.isError ?? false, headChars);
+        const text = truncatedResultText(
+          result.text,
+          result.isError ?? false,
+          headChars,
+          archived.get(result.tool_use_id),
+        );
         return text === result.text
           ? result
           : {
@@ -254,10 +312,11 @@ export function applyDecisions(
       kept.push(message);
       continue;
     }
-    if (message.text.trim().length === 0 && toolUses.length === 0 && toolResults.length === 0) {
+    const text = [message.text, ...notes].filter(Boolean).join('\n');
+    if (text.trim().length === 0 && toolUses.length === 0 && toolResults.length === 0) {
       continue;
     }
-    const rebuilt: Message = { role: message.role, text: message.text, toolUses };
+    const rebuilt: Message = { role: message.role, text, toolUses };
     if (toolResults.length > 0) rebuilt.toolResults = toolResults;
     kept.push(rebuilt);
   }
@@ -331,6 +390,7 @@ export async function compact(
     decisions,
     calls,
     resolved.truncateHeadChars,
+    options.archive,
   );
   return {
     messages: kept,

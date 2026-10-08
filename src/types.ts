@@ -1,3 +1,15 @@
+/**
+ * Receives the full output of a dropped call or truncated result and returns
+ * the path it was saved under, to cite in place of the output; undefined when
+ * it was not saved.
+ */
+export type ArchiveResult = (output: {
+  tool_use_id: string;
+  tool: string;
+  input: Record<string, unknown>;
+  text: string;
+}) => string | undefined;
+
 export type Role = 'user' | 'assistant';
 
 /**
@@ -97,6 +109,8 @@ export interface FittedState {
 }
 
 export interface CompactOptions {
+  /** Saves the output compaction removes; see `ArchiveResult`. */
+  archive?: ArchiveResult;
   /** Ongoing task description; defaults to the last few user prompts. */
   goal?: string;
   /** Minimum keep probability for a call or result to stay. Default 0.5. */

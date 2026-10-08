@@ -81,10 +81,13 @@ built-in compaction summary with the original messages.
    - `keepResult ≥ threshold` → keep call and result;
    - else `keepCall ≥ threshold` → keep the call, truncate the result to its
      first `truncateHeadChars` characters plus a one-line note;
-   - else → remove the call together with its result.
+   - else → remove the call together with its result, leaving one line in its
+     message that names the tool and its input.
 7. The message list is rebuilt: a message that loses all its content is
    removed, untouched messages are returned as the same objects, and no result
-   is ever left without its call.
+   is ever left without its call. With an `archive` callback, the full output
+   of each removed call or truncated result is passed to it first, and the path
+   it returns is cited in the note so the assistant can read the output back.
 
 Jev failures, malformed answers, a missing key, or a history that cannot be
 fitted throw; the caller (or the Claude Code hook) decides what to fall back to.
@@ -148,6 +151,7 @@ put it in a source file.
 | `maxStateTokens` | `25000` | Estimated token ceiling for the state |
 | `maxRequestTokens` | `30000` | Estimated ceiling for state plus one batch of questions |
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
+| `archive` | none | `({ tool_use_id, tool, input, text }) => path \| undefined`; saves removed output and returns the path to cite |
 
 `result.stats` reports message and character counts before and after, the
 per-reason decision counts, the state size in estimated tokens, which fitting
@@ -161,7 +165,9 @@ stage was needed, and the number of requests.
   `Bash` (`cat`, `sed -n`) are left to Jev.
 - Token sizes are estimates from character counts, not a tokenizer.
 - Calibration is at the request level; a probability is not a proof that a
-  result is safe to delete. The assistant can always re-run the tool.
+  result is safe to delete. The plugin saves removed output under
+  `.claude/fast-jev-compaction/` by default (`archiveResults`), so the
+  assistant can read it back; otherwise it can re-run the tool.
 - The full state is repeated with every request, so a history near the state
   ceiling costs one request per handful of questions.
 
