@@ -5,7 +5,7 @@ every tool call and result is scored in one fast request, stale ones are
 dropped or truncated, everything kept stays verbatim. Also usable as an npm
 library.
 
-## This fork (0.4.0)
+## This fork (0.5.0)
 
 Changes on top of upstream `tamaratran/fast-jev-compaction` 0.3.0:
 
@@ -29,6 +29,15 @@ Changes on top of upstream `tamaratran/fast-jev-compaction` 0.3.0:
   a fork of the session model (`$.model.fork`, served from the prompt cache)
   and the rest stays verbatim; without a fork (a session resumed straight into
   `/compact`) the engine's own summarizer runs over the older part alone.
+- **Removed output is saved.** A dropped call leaves one line naming the tool
+  and its input, and the full output of every dropped call or truncated
+  result goes to `.claude/fast-jev-compaction/` in the project (git-ignored),
+  cited in place so the assistant can read it back (`archiveResults`, on by
+  default; anything credential-shaped is never written). Ported from
+  upstream's unmerged `bash-output-trim` branch.
+- **The summary fork is not compacted.** The fork sees the full transcript
+  and crosses the engine's threshold itself; its compaction used to run a
+  second summarizer (or Jev pass) and summarise a summary. It is now skipped.
 - **Decision records.** Every compaction writes one JSON record (outcome,
   token counts, per-call verdicts with inputs, message shapes) to `logDir`,
   default `~/.local/state/fast-jev-compaction/`.

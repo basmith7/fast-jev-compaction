@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  FORK_SKIP,
+  register,
   archiveWriter,
   compactSession,
   looksSecret,
@@ -210,6 +212,9 @@ describe('decision record', () => {
       ['t2', 'Bash', '{"command":"npm test"}'],
     ]);
     expect(recordPath('/x/logs/', '2026-09-22T10:00:00.000Z', 'auto')).toBe('/x/logs/2026-09-22T10-00-00-000Z-auto.json');
+    expect(recordPath('/x/logs', '2026-09-22T10:00:00.000Z', 'auto', 'a1/../b')).toBe(
+      '/x/logs/2026-09-22T10-00-00-000Z-auto-a1____b.json',
+    );
   });
 
   it('reads the new options', () => {
@@ -305,5 +310,70 @@ describe('compactSession archive', () => {
     );
     expect(files.get('.claude/fast-jev-compaction/result-tool-1.txt')).toBe(fileA);
     expect(messages[1]?.text).toContain('full output: .claude/fast-jev-compaction/result-tool-1.txt');
+  });
+});
+
+describe('session.compact under the summary fork', () => {
+  function engine(onFork: (compact: Handler, $: unknown) => Promise<unknown>) {
+    const handlers = new Map<string, Handler>();
+    const files = new Map<string, string>();
+    const forkResults: unknown[] = [];
+    const $ = {
+      env: { get: async (name: string) => (name === 'TYPESAFE_API_KEY' ? 'k' : undefined) },
+      settings: { read: async () => ({}) },
+      http: { fetch: jevFetch((name) => (name.endsWith('t1') ? 0.1 : 0.9)) },
+      ui: { log: () => {}, toast: () => {} },
+      fs: { exists: async (p: string) => files.has(p), write: async (p: string, t: string) => void files.set(p, t) },
+      model: {
+        fork: async () => {
+          forkResults.push(await onFork(handlers.get('session.compact')!, $));
+          return { isAnswered: true, text: 'SUMMARY', usage: {} };
+        },
+      },
+    };
+    const on = (name: string, handler: Handler) => void handlers.set(name, handler);
+    register(on as never, {
+      preserveRecentMessages: 1,
+      preserveRecentPrompts: 1,
+      summaryAboveTokens: 1,
+      logDir: 'logs',
+      archiveResults: false,
+    });
+    return { $, files, forkResults, compact: handlers.get('session.compact')! };
+  }
+  type Handler = (...args: any[]) => Promise<any>;
+  const main = () => [
+    message('user', 'Fix the failing test.', { handle: 'h-0' }),
+    call('tool-1', 'Read', { file_path: 'src/a.ts' }, fileA),
+    result('tool-1', fileA),
+    message('assistant', 'Read it.', { handle: 'h-3' }),
+    message('user', 'now run the tests', { handle: 'h-4' }),
+    message('assistant', 'Running.', { handle: 'h-5' }),
+  ];
+  const core = async () => ({ messages: [message('user', 'core summary')] });
+
+  it('skips the fork\'s own compaction and records why', async () => {
+    const { $, files, forkResults, compact } = engine((handler, engine$) =>
+      handler(engine$, { trigger: 'auto', agentId: 'fork-1', messages: main().slice(0, -1) }, core),
+    );
+    const out = await compact($, { trigger: 'auto', messages: main() }, core);
+    expect(forkResults).toEqual([{ skip: FORK_SKIP }]);
+    expect(out.messages[0].text).toContain('SUMMARY');
+    const records = [...files.entries()].filter(([path]) => path.startsWith('logs/')).map(([, t]) => JSON.parse(t));
+    expect(records.map((r) => [r.outcome, r.agentId ?? null])).toEqual([
+      ['skipped', 'fork-1'],
+      ['jev+summary', null],
+    ]);
+  });
+
+  it('still compacts a subagent that is not the fork, during the fork and after it', async () => {
+    const subagent = () => [message('user', 'Survey the repo.'), ...main().slice(1)];
+    const { $, forkResults, compact } = engine((handler, engine$) =>
+      handler(engine$, { trigger: 'auto', agentId: 'sub-1', messages: subagent() }, core),
+    );
+    await compact($, { trigger: 'auto', messages: main() }, core);
+    expect(forkResults[0]).not.toEqual({ skip: FORK_SKIP });
+    const after = await compact($, { trigger: 'auto', agentId: 'fork-2', messages: main() }, core);
+    expect(after).not.toEqual({ skip: FORK_SKIP });
   });
 });

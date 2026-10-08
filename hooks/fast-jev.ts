@@ -321,7 +321,7 @@ export type CompactionRecord = {
   time: string;
   trigger: string;
   agentId?: string;
-  outcome: 'jev' | 'jev+summary' | 'fallback';
+  outcome: 'jev' | 'jev+summary' | 'fallback' | 'skipped';
   reason?: string;
   messagesBefore: number;
   /** One `role:textChars:toolUses:toolResults[:P]` per message (P marks a prompt), for diagnosing pinning. */
@@ -377,8 +377,24 @@ export function messageShape(messages: readonly Message[]): string[] {
   );
 }
 
-export function recordPath(dir: string, time: string, trigger: string): string {
-  return `${dir.replace(/\/+$/, '')}/${time.replace(/[:.]/g, '-')}-${trigger}.json`;
+/**
+ * Identifies a conversation by its opening messages. The summary tier's fork is
+ * sent the main thread's last request, so its transcript opens the same way as
+ * the one being summarised; a subagent's opens with its own task.
+ */
+export function transcriptKey(messages: readonly Message[]): string {
+  return messages
+    .slice(0, 2)
+    .map((m) => `${m.role}:${m.text}`)
+    .join('\n');
+}
+
+export const FORK_SKIP = 'the summary fork reads the transcript whole';
+
+/** One file per compaction; a subagent's or fork's carries its id, so it never overwrites the main one. */
+export function recordPath(dir: string, time: string, trigger: string, agentId?: string): string {
+  const agent = agentId ? `-${agentId.replace(/[^\w-]/g, '_')}` : '';
+  return `${dir.replace(/\/+$/, '')}/${time.replace(/[:.]/g, '-')}-${trigger}${agent}.json`;
 }
 
 function percent(ratio: number): string {
@@ -472,7 +488,7 @@ async function writeRecord($: Engine, config: HookConfig, record: CompactionReco
     const home = await $.env.get('HOME');
     const dir = config.logDir || (home ? `${home}/.local/state/fast-jev-compaction` : '');
     if (!dir) return;
-    await $.fs.write(recordPath(dir, record.time, record.trigger), JSON.stringify(record, null, 1));
+    await $.fs.write(recordPath(dir, record.time, record.trigger, record.agentId), JSON.stringify(record, null, 1));
   } catch (error) {
     $.ui.log(`could not write the compaction record (${error instanceof Error ? error.message : String(error)})`);
   }
@@ -481,6 +497,8 @@ async function writeRecord($: Engine, config: HookConfig, record: CompactionReco
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
+  /** transcriptKey of each conversation whose summary fork is in flight. */
+  const forking = new Set<string>();
 
   on('session.compact', async ($, event: SessionCompactInput, next) => {
     const record: CompactionRecord = {
@@ -492,6 +510,15 @@ export const register: Register = (on: On, options: PluginOptions) => {
       tokensBefore: transcriptTokens(event.messages),
     };
     if (event.agentId) record.agentId = event.agentId;
+    // The fork carries the main thread's full transcript, so it crosses the
+    // engine's threshold too. Compacting it would cost a second summarizer
+    // call or a Jev pass, lose the prompt cache, and summarise a summary.
+    if (event.agentId && event.trigger !== 'manual' && forking.has(transcriptKey(event.messages))) {
+      record.outcome = 'skipped';
+      record.reason = FORK_SKIP;
+      await writeRecord($, configured, record);
+      return { skip: FORK_SKIP };
+    }
     const fallback = async (reason: string) => {
       notify($, `fallback to built-in summary (${reason})`);
       record.reason = reason;
@@ -530,7 +557,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (cut < 0) {
         record.summary = { skipped: 'no earlier prompt to cut at' };
       } else {
-        const reply = await $.model.fork({ prompt: summaryPrompt(messages[cut]!.text) });
+        const key = transcriptKey(event.messages);
+        forking.add(key);
+        const reply = await $.model
+          .fork({ prompt: summaryPrompt(messages[cut]!.text) })
+          .finally(() => forking.delete(key));
         if (reply.isAnswered && reply.text.trim()) {
           messages = [summaryMessage(reply.text), ...messages.slice(cut)];
           record.summary = { chars: reply.text.length, usage: reply.usage };

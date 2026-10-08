@@ -92,7 +92,10 @@ the conversation is still above `summaryAboveTokens` (and this is neither a
 `precompute` nor a subagent's compaction), everything before the
 `preserveRecentPrompts`-th newest prompt is replaced by a summary from
 `$.model.fork`, or from the engine's summarizer run over that part alone when
-there is nothing to fork. Every outcome, fallbacks included, is written as a
+there is nothing to fork. The fork is sent the whole transcript, so the
+engine may try to compact it too; that compaction is skipped (recorded with
+outcome `skipped`), so the summary is written from the full history and the
+prompt cache. Every outcome, fallbacks included, is written as a
 JSON record to `logDir`. The `turn.complete` hook requests compaction when
 `context.tokens` reaches `compactAtTokens` or `context.percent` reaches
 `compactAtPercent`, with an in-flight guard; headless and SDK sessions cannot
